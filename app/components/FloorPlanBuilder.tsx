@@ -1,0 +1,4084 @@
+"use client";
+
+import React, { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+import { db } from "../lib/firebase";
+
+type Point = {
+  x: number;
+  y: number;
+};
+
+type Wall = {
+  id: number;
+  start: Point;
+  end: Point;
+  thickness: number;
+  label?: string;
+};
+
+type DoorLike = {
+  id: number;
+  wallId: number;
+  offset: number;
+  width: number;
+  kind: "door" | "opening";
+  hingeSide: "start" | "end";
+  swingDirection: "left" | "right";
+  inward: boolean;
+  label?: string;
+};
+
+type WindowItem = {
+  id: number;
+  wallId: number;
+  offset: number;
+  width: number;
+  label?: string;
+};
+
+type Stair = {
+  id: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  steps: number;
+  direction: "up" | "down";
+  label?: string;
+};
+
+type RoomLabel = {
+  id: number;
+  x: number;
+  y: number;
+  text: string;
+};
+
+type ExitPath = {
+  id: number;
+  points: Point[];
+  label?: string;
+};
+
+type FireExtinguisher = {
+  id: number;
+  x: number;
+  y: number;
+  size: number;
+  label?: string;
+};
+
+type LogoPlacement =
+  | "top-left"
+  | "top-center"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-center"
+  | "bottom-right";
+
+type TitleBlock = {
+  projectTitle: string;
+  buildingName: string;
+  floorName: string;
+  drawnBy: string;
+  date: string;
+  revision: string;
+};
+
+type BlockedZone = {
+  id: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label?: string;
+};
+
+type RouteResult = {
+  exitLabel: string;
+  path: Point[];
+  distance: number;
+};
+
+type TravelCheck = {
+  exitLabel: string;
+  distance: number;
+  compliant: boolean;
+};
+
+type AutoSafetySymbolType =
+  | "assembly"
+  | "first-aid"
+  | "aed"
+  | "pull-station"
+  | "emergency-light";
+
+type AutoSafetySymbol = {
+  id: number;
+  type: AutoSafetySymbolType;
+  x: number;
+  y: number;
+  label?: string;
+};
+
+type ExitTarget = {
+  label: string;
+  point: Point;
+};
+
+type GridData = {
+  cells: number[][];
+  cols: number;
+  rows: number;
+  resolution: number;
+  planWidth: number;
+  planHeight: number;
+};
+
+function parseDimension(input: string): number {
+  const raw = input.trim().toLowerCase();
+
+  if (!raw) return 0;
+
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    return parseFloat(raw);
+  }
+
+  let feet = 0;
+  let inches = 0;
+
+  const ftMatch = raw.match(/(\d+(\.\d+)?)\s*(ft|feet|')/);
+  const inMatch = raw.match(/(\d+(\.\d+)?)\s*(in|inch|inches|")/);
+
+  if (ftMatch) feet = parseFloat(ftMatch[1]);
+  if (inMatch) inches = parseFloat(inMatch[1]);
+
+  if (!ftMatch && inMatch) {
+    return inches / 12;
+  }
+
+  return feet + inches / 12;
+}
+
+function formatFeet(value: number): string {
+  if (!Number.isFinite(value)) return `0'`;
+
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  let wholeFeet = Math.floor(abs);
+  let inches = Math.round((abs - wholeFeet) * 12);
+
+  if (inches === 12) {
+    wholeFeet += 1;
+    inches = 0;
+  }
+
+  if (inches === 0) {
+    return `${sign}${wholeFeet}'`;
+  }
+
+  return `${sign}${wholeFeet}' ${inches}"`;
+}
+
+function distance(a: Point, b: Point) {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function midpoint(a: Point, b: Point): Point {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  };
+}
+
+function normalizeVector(a: Point, b: Point) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+
+  return {
+    ux: dx / len,
+    uy: dy / len,
+    len,
+  };
+}
+
+function wallPolygonPoints(wall: Wall): Point[] {
+  const { ux, uy } = normalizeVector(wall.start, wall.end);
+  const px = -uy;
+  const py = ux;
+  const half = wall.thickness / 2;
+
+  return [
+    { x: wall.start.x + px * half, y: wall.start.y + py * half },
+    { x: wall.end.x + px * half, y: wall.end.y + py * half },
+    { x: wall.end.x - px * half, y: wall.end.y - py * half },
+    { x: wall.start.x - px * half, y: wall.start.y - py * half },
+  ];
+}
+
+function pointsToSvgString(points: Point[]) {
+  return points.map((p) => `${p.x},${p.y}`).join(" ");
+}
+
+function pointAtOffsetOnWall(wall: Wall, offset: number): Point {
+  const { ux, uy } = normalizeVector(wall.start, wall.end);
+  return {
+    x: wall.start.x + ux * offset,
+    y: wall.start.y + uy * offset,
+  };
+}
+
+function parsePointList(input: string): Point[] {
+  return input
+    .split(";")
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const [rawX, rawY] = pair.split(",").map((v) => v.trim());
+      return {
+        x: parseDimension(rawX || "0"),
+        y: parseDimension(rawY || "0"),
+      };
+    })
+    .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function wallLength(wall: Wall) {
+  return distance(wall.start, wall.end);
+}
+
+function pointInPolygon(point: Point, polygon: Point[]): boolean {
+  let inside = false;
+
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+
+    const intersects =
+      yi > point.y !== yj > point.y &&
+      point.x < ((xj - xi) * (point.y - yi)) / ((yj - yi) || 1e-9) + xi;
+
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+
+  return inside;
+}
+
+function distancePointToSegment(p: Point, a: Point, b: Point): number {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const apx = p.x - a.x;
+  const apy = p.y - a.y;
+  const abLenSq = abx * abx + aby * aby || 1;
+
+  let t = (apx * abx + apy * aby) / abLenSq;
+  t = Math.max(0, Math.min(1, t));
+
+  const closest = {
+    x: a.x + abx * t,
+    y: a.y + aby * t,
+  };
+
+  return distance(p, closest);
+}
+
+function createGrid(
+  planWidth: number,
+  planHeight: number,
+  resolution = 1
+): GridData {
+  const cols = Math.ceil(planWidth / resolution) + 1;
+  const rows = Math.ceil(planHeight / resolution) + 1;
+
+  return {
+    cells: Array.from({ length: rows }, () => Array(cols).fill(0)),
+    cols,
+    rows,
+    resolution,
+    planWidth,
+    planHeight,
+  };
+}
+
+function worldToGrid(grid: GridData, point: Point) {
+  const gx = Math.max(
+    0,
+    Math.min(grid.cols - 1, Math.floor(point.x / grid.resolution))
+  );
+  const gy = Math.max(
+    0,
+    Math.min(grid.rows - 1, Math.floor(point.y / grid.resolution))
+  );
+
+  return { gx, gy };
+}
+
+function gridToWorld(grid: GridData, gx: number, gy: number): Point {
+  return {
+    x: gx * grid.resolution + grid.resolution / 2,
+    y: gy * grid.resolution + grid.resolution / 2,
+  };
+}
+
+function setCell(grid: GridData, gx: number, gy: number, value: number) {
+  if (gx < 0 || gy < 0 || gx >= grid.cols || gy >= grid.rows) return;
+  grid.cells[gy][gx] = value;
+}
+
+function rasterizePolygon(grid: GridData, polygon: Point[], value: number) {
+  const xs = polygon.map((p) => p.x);
+  const ys = polygon.map((p) => p.y);
+
+  const minX = Math.max(0, Math.min(...xs));
+  const maxX = Math.min(grid.planWidth, Math.max(...xs));
+  const minY = Math.max(0, Math.min(...ys));
+  const maxY = Math.min(grid.planHeight, Math.max(...ys));
+
+  const topLeft = worldToGrid(grid, { x: minX, y: minY });
+  const bottomRight = worldToGrid(grid, { x: maxX, y: maxY });
+
+  for (let gy = topLeft.gy; gy <= bottomRight.gy; gy++) {
+    for (let gx = topLeft.gx; gx <= bottomRight.gx; gx++) {
+      const center = gridToWorld(grid, gx, gy);
+      if (pointInPolygon(center, polygon)) {
+        setCell(grid, gx, gy, value);
+      }
+    }
+  }
+}
+
+function rasterizeSegment(
+  grid: GridData,
+  a: Point,
+  b: Point,
+  thickness: number,
+  value: number
+) {
+  const minX = Math.max(0, Math.min(a.x, b.x) - thickness);
+  const maxX = Math.min(grid.planWidth, Math.max(a.x, b.x) + thickness);
+  const minY = Math.max(0, Math.min(a.y, b.y) - thickness);
+  const maxY = Math.min(grid.planHeight, Math.max(a.y, b.y) + thickness);
+
+  const topLeft = worldToGrid(grid, { x: minX, y: minY });
+  const bottomRight = worldToGrid(grid, { x: maxX, y: maxY });
+
+  for (let gy = topLeft.gy; gy <= bottomRight.gy; gy++) {
+    for (let gx = topLeft.gx; gx <= bottomRight.gx; gx++) {
+      const center = gridToWorld(grid, gx, gy);
+      const d = distancePointToSegment(center, a, b);
+
+      if (d <= thickness / 2) {
+        setCell(grid, gx, gy, value);
+      }
+    }
+  }
+}
+
+function rasterizeBlockedZone(
+  grid: GridData,
+  zone: BlockedZone,
+  value: number
+) {
+  const topLeft = worldToGrid(grid, { x: zone.x, y: zone.y });
+  const bottomRight = worldToGrid(grid, {
+    x: zone.x + zone.width,
+    y: zone.y + zone.height,
+  });
+
+  for (let gy = topLeft.gy; gy <= bottomRight.gy; gy++) {
+    for (let gx = topLeft.gx; gx <= bottomRight.gx; gx++) {
+      setCell(grid, gx, gy, value);
+    }
+  }
+}
+
+function buildOccupancyGrid(params: {
+  planWidth: number;
+  planHeight: number;
+  walls: Wall[];
+  doors: DoorLike[];
+  blockedZones: BlockedZone[];
+  resolution: number;
+  doorwayClearance: number;
+}) {
+  const {
+    planWidth,
+    planHeight,
+    walls,
+    doors,
+    blockedZones,
+    resolution,
+    doorwayClearance,
+  } = params;
+
+  const grid = createGrid(planWidth, planHeight, resolution);
+
+  for (const wall of walls) {
+    rasterizePolygon(grid, wallPolygonPoints(wall), 1);
+  }
+
+  for (const zone of blockedZones) {
+    rasterizeBlockedZone(grid, zone, 1);
+  }
+
+  for (const door of doors) {
+    const wall = walls.find((w) => w.id === door.wallId);
+    if (!wall) continue;
+
+    const gapStart = pointAtOffsetOnWall(wall, door.offset);
+    const gapEnd = pointAtOffsetOnWall(wall, door.offset + door.width);
+
+    rasterizeSegment(
+      grid,
+      gapStart,
+      gapEnd,
+      wall.thickness + doorwayClearance,
+      0
+    );
+  }
+
+  return grid;
+}
+
+function findClosestWalkableCell(
+  grid: GridData,
+  point: Point,
+  maxRadiusFeet = 20
+) {
+  const start = worldToGrid(grid, point);
+
+  if (grid.cells[start.gy]?.[start.gx] === 0) {
+    return start;
+  }
+
+  const maxRadiusCells = Math.max(
+    1,
+    Math.ceil(maxRadiusFeet / grid.resolution)
+  );
+
+  for (let r = 1; r <= maxRadiusCells; r++) {
+    for (let gy = start.gy - r; gy <= start.gy + r; gy++) {
+      for (let gx = start.gx - r; gx <= start.gx + r; gx++) {
+        const onPerimeter =
+          gy === start.gy - r ||
+          gy === start.gy + r ||
+          gx === start.gx - r ||
+          gx === start.gx + r;
+
+        if (!onPerimeter) continue;
+        if (gx < 0 || gy < 0 || gx >= grid.cols || gy >= grid.rows) continue;
+        if (grid.cells[gy][gx] === 0) {
+          return { gx, gy };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function canMoveDiagonal(
+  grid: GridData,
+  current: { gx: number; gy: number },
+  next: { gx: number; gy: number }
+) {
+  const dx = next.gx - current.gx;
+  const dy = next.gy - current.gy;
+
+  if (Math.abs(dx) !== 1 || Math.abs(dy) !== 1) return true;
+
+  const sideA = grid.cells[current.gy]?.[current.gx + dx] === 0;
+  const sideB = grid.cells[current.gy + dy]?.[current.gx] === 0;
+
+  return sideA && sideB;
+}
+
+function findPathOnGrid(
+  grid: GridData,
+  startWorld: Point,
+  endWorld: Point
+): Point[] {
+  const start = findClosestWalkableCell(grid, startWorld);
+  const end = findClosestWalkableCell(grid, endWorld);
+
+  if (!start || !end) {
+    return [];
+  }
+
+  const key = (gx: number, gy: number) => `${gx},${gy}`;
+
+  type OpenNode = {
+    gx: number;
+    gy: number;
+    g: number;
+    f: number;
+  };
+
+  const heuristic = (
+    a: { gx: number; gy: number },
+    b: { gx: number; gy: number }
+  ) => Math.hypot(b.gx - a.gx, b.gy - a.gy);
+
+  const open = new Map<string, OpenNode>();
+  const closed = new Set<string>();
+  const parents = new Map<string, string>();
+
+  const startKey = key(start.gx, start.gy);
+  open.set(startKey, {
+    gx: start.gx,
+    gy: start.gy,
+    g: 0,
+    f: heuristic(start, end),
+  });
+
+  const directions = [
+    { dx: 1, dy: 0, cost: 1 },
+    { dx: -1, dy: 0, cost: 1 },
+    { dx: 0, dy: 1, cost: 1 },
+    { dx: 0, dy: -1, cost: 1 },
+    { dx: 1, dy: 1, cost: Math.SQRT2 },
+    { dx: -1, dy: 1, cost: Math.SQRT2 },
+    { dx: 1, dy: -1, cost: Math.SQRT2 },
+    { dx: -1, dy: -1, cost: Math.SQRT2 },
+  ];
+
+  while (open.size > 0) {
+    let current: OpenNode | null = null;
+
+    for (const node of open.values()) {
+      if (!current || node.f < current.f) {
+        current = node;
+      }
+    }
+
+    if (!current) break;
+
+    const currentKey = key(current.gx, current.gy);
+
+    if (current.gx === end.gx && current.gy === end.gy) {
+      const path: Point[] = [];
+      let walkKey: string | undefined = currentKey;
+
+      while (walkKey) {
+        const [gxRaw, gyRaw] = walkKey.split(",");
+        const gx = Number(gxRaw);
+        const gy = Number(gyRaw);
+        path.push(gridToWorld(grid, gx, gy));
+        walkKey = parents.get(walkKey);
+      }
+
+      return path.reverse();
+    }
+
+    open.delete(currentKey);
+    closed.add(currentKey);
+
+    for (const dir of directions) {
+      const next = {
+        gx: current.gx + dir.dx,
+        gy: current.gy + dir.dy,
+      };
+
+      if (
+        next.gx < 0 ||
+        next.gy < 0 ||
+        next.gx >= grid.cols ||
+        next.gy >= grid.rows
+      ) {
+        continue;
+      }
+
+      if (grid.cells[next.gy][next.gx] !== 0) continue;
+      if (!canMoveDiagonal(grid, current, next)) continue;
+
+      const nextKey = key(next.gx, next.gy);
+      if (closed.has(nextKey)) continue;
+
+      const tentativeG = current.g + dir.cost;
+      const existing = open.get(nextKey);
+
+      if (!existing || tentativeG < existing.g) {
+        const h = heuristic(next, end);
+        open.set(nextKey, {
+          gx: next.gx,
+          gy: next.gy,
+          g: tentativeG,
+          f: tentativeG + h,
+        });
+        parents.set(nextKey, currentKey);
+      }
+    }
+  }
+
+  return [];
+}
+
+function compressPath(path: Point[]): Point[] {
+  if (path.length <= 2) return path;
+
+  const out: Point[] = [path[0]];
+
+  for (let i = 1; i < path.length - 1; i++) {
+    const prev = out[out.length - 1];
+    const curr = path[i];
+    const next = path[i + 1];
+
+    const ax = curr.x - prev.x;
+    const ay = curr.y - prev.y;
+    const bx = next.x - curr.x;
+    const by = next.y - curr.y;
+    const cross = ax * by - ay * bx;
+
+    if (Math.abs(cross) > 1e-6) {
+      out.push(curr);
+    }
+  }
+
+  out.push(path[path.length - 1]);
+  return out;
+}
+
+function detectExitTargets(params: {
+  doors: DoorLike[];
+  walls: Wall[];
+  roomLabels: RoomLabel[];
+}): ExitTarget[] {
+  const { doors, walls, roomLabels } = params;
+  const EXIT_REGEX = /(exit|egress|gate|beach access)/i;
+
+  const labelTargets: ExitTarget[] = roomLabels
+    .filter((label) => EXIT_REGEX.test(label.text))
+    .map((label) => ({
+      label: label.text,
+      point: { x: label.x, y: label.y },
+    }));
+
+  const doorTargets: ExitTarget[] = doors
+    .filter((door) => EXIT_REGEX.test(door.label || ""))
+    .map((door) => {
+      const wall = walls.find((w) => w.id === door.wallId);
+      if (!wall) return null;
+
+      const a = pointAtOffsetOnWall(wall, door.offset);
+      const b = pointAtOffsetOnWall(wall, door.offset + door.width);
+
+      return {
+        label: door.label || `Exit ${door.id}`,
+        point: midpoint(a, b),
+      };
+    })
+    .filter((x): x is ExitTarget => x !== null);
+
+  const merged = [...labelTargets, ...doorTargets];
+  const seen = new Set<string>();
+  const out: ExitTarget[] = [];
+
+  for (const item of merged) {
+    const k = `${Math.round(item.point.x)}-${Math.round(item.point.y)}-${item.label}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(item);
+  }
+
+  return out;
+}
+
+function calculateTravelDistance(path: Point[]) {
+  let total = 0;
+
+  for (let i = 1; i < path.length; i++) {
+    total += Math.hypot(
+      path[i].x - path[i - 1].x,
+      path[i].y - path[i - 1].y
+    );
+  }
+
+  return total;
+}
+
+function generateRoutes(params: {
+  start: Point;
+  exits: ExitTarget[];
+  grid: GridData;
+  maxRoutes?: number;
+}): RouteResult[] {
+  const { start, exits, grid, maxRoutes = 3 } = params;
+  const routes: RouteResult[] = [];
+
+  for (const exit of exits) {
+    const rawPath = findPathOnGrid(grid, start, exit.point);
+    if (!rawPath.length) continue;
+
+    const path = compressPath(rawPath);
+    routes.push({
+      exitLabel: exit.label,
+      path,
+      distance: calculateTravelDistance(path),
+    });
+  }
+
+  return routes.sort((a, b) => a.distance - b.distance).slice(0, maxRoutes);
+}
+
+function calculateOccupantLoad(area: number, factor: number) {
+  if (area <= 0 || factor <= 0) return 0;
+  return Math.ceil(area / factor);
+}
+
+type FloorPlanBuilderProps = {
+  userId?: string;
+  initialDraft?: any;
+};
+
+export default function FloorPlanBuilder({
+  userId,
+  initialDraft,
+}: FloorPlanBuilderProps) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [autosaveStatus, setAutosaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [draftHydrated, setDraftHydrated] = useState(false);
+
+  // Plan settings
+  const [planWidthInput, setPlanWidthInput] = useState("80'");
+  const [planHeightInput, setPlanHeightInput] = useState("50'");
+  const [defaultWallThicknessInput, setDefaultWallThicknessInput] =
+    useState(`0' 6"`);
+
+  const planWidth = Math.max(1, parseDimension(planWidthInput));
+  const planHeight = Math.max(1, parseDimension(planHeightInput));
+  const defaultWallThickness = Math.max(
+    0.1,
+    parseDimension(defaultWallThicknessInput)
+  );
+
+  // Walls
+  const [wallStartXInput, setWallStartXInput] = useState("5'");
+  const [wallStartYInput, setWallStartYInput] = useState("5'");
+  const [wallEndXInput, setWallEndXInput] = useState("35'");
+  const [wallEndYInput, setWallEndYInput] = useState("5'");
+  const [wallThicknessInput, setWallThicknessInput] = useState(`0' 6"`);
+  const [wallLabelInput, setWallLabelInput] = useState("");
+  const [walls, setWalls] = useState<Wall[]>([]);
+
+  // Doors / openings
+  const [doorWallId, setDoorWallId] = useState<number>(0);
+  const [doorOffsetInput, setDoorOffsetInput] = useState("3'");
+  const [doorWidthInput, setDoorWidthInput] = useState("3'");
+  const [doorKind, setDoorKind] = useState<"door" | "opening">("door");
+  const [doorHingeSide, setDoorHingeSide] = useState<"start" | "end">(
+    "start"
+  );
+  const [doorSwingDirection, setDoorSwingDirection] = useState<
+    "left" | "right"
+  >("left");
+  const [doorInward, setDoorInward] = useState(true);
+  const [doorLabelInput, setDoorLabelInput] = useState("");
+  const [doors, setDoors] = useState<DoorLike[]>([]);
+
+  // Windows
+  const [windowWallId, setWindowWallId] = useState<number>(0);
+  const [windowOffsetInput, setWindowOffsetInput] = useState("4'");
+  const [windowWidthInput, setWindowWidthInput] = useState("4'");
+  const [windowLabelInput, setWindowLabelInput] = useState("");
+  const [windows, setWindows] = useState<WindowItem[]>([]);
+
+  // Stairs
+  const [stairXInput, setStairXInput] = useState("45'");
+  const [stairYInput, setStairYInput] = useState("8'");
+  const [stairWidthInput, setStairWidthInput] = useState("10'");
+  const [stairHeightInput, setStairHeightInput] = useState("14'");
+  const [stairStepsInput, setStairStepsInput] = useState("8");
+  const [stairDirection, setStairDirection] = useState<"up" | "down">("up");
+  const [stairLabelInput, setStairLabelInput] = useState("Stairs");
+  const [stairs, setStairs] = useState<Stair[]>([]);
+
+  // Room labels
+  const [roomLabelXInput, setRoomLabelXInput] = useState("15'");
+  const [roomLabelYInput, setRoomLabelYInput] = useState("15'");
+  const [roomLabelTextInput, setRoomLabelTextInput] = useState("Office");
+  const [roomLabels, setRoomLabels] = useState<RoomLabel[]>([]);
+
+  // Manual exit paths
+  const [exitPathPointsInput, setExitPathPointsInput] = useState(
+    `5',5'; 20',5'; 20',20'; 35',20'`
+  );
+  const [exitPathLabelInput, setExitPathLabelInput] =
+    useState("Primary Exit Route");
+  const [exitPaths, setExitPaths] = useState<ExitPath[]>([]);
+
+  // Fire extinguishers
+  const [fireXInput, setFireXInput] = useState("8'");
+  const [fireYInput, setFireYInput] = useState("8'");
+  const [fireSizeInput, setFireSizeInput] = useState("2'");
+  const [fireLabelInput, setFireLabelInput] = useState("FE");
+  const [fireExtinguishers, setFireExtinguishers] = useState<
+    FireExtinguisher[]
+  >([]);
+
+  // Logo / title block
+  const [logoDataUrl, setLogoDataUrl] = useState<string>("");
+  const [logoPlacement, setLogoPlacement] =
+    useState<LogoPlacement>("top-left");
+  const [logoSizeInput, setLogoSizeInput] = useState("8'");
+  const [logoPaddingInput, setLogoPaddingInput] = useState("1'");
+  const [titleBlock, setTitleBlock] = useState<TitleBlock>({
+    projectTitle: "Emergency Evacuation Plan",
+    buildingName: "Building A",
+    floorName: "First Floor",
+    drawnBy: "Kevin Wiley",
+    date: new Date().toISOString().slice(0, 10),
+    revision: "A",
+  });
+
+  // Smart routing
+  const [gridResolutionInput, setGridResolutionInput] = useState("1'");
+  const [maxTravelDistanceInput, setMaxTravelDistanceInput] =
+    useState("200'");
+  const [youAreHereXInput, setYouAreHereXInput] = useState("102'");
+  const [youAreHereYInput, setYouAreHereYInput] = useState("120'");
+  const [autoRoutes, setAutoRoutes] = useState<RouteResult[]>([]);
+  const [travelChecks, setTravelChecks] = useState<TravelCheck[]>([]);
+  const [routeMessage, setRouteMessage] = useState("");
+
+  // Blocked zones
+  const [blockedZoneXInput, setBlockedZoneXInput] = useState("96'");
+  const [blockedZoneYInput, setBlockedZoneYInput] = useState("120'");
+  const [blockedZoneWidthInput, setBlockedZoneWidthInput] = useState("12'");
+  const [blockedZoneHeightInput, setBlockedZoneHeightInput] = useState("10'");
+  const [blockedZoneLabelInput, setBlockedZoneLabelInput] =
+    useState("Blocked Corridor");
+  const [blockedZones, setBlockedZones] = useState<BlockedZone[]>([]);
+
+  // Uploaded plan image + zoom
+  const [uploadedPlanDataUrl, setUploadedPlanDataUrl] = useState("");
+  const [showUploadedPlan, setShowUploadedPlan] = useState(true);
+  const [uploadedPlanXInput, setUploadedPlanXInput] = useState("0'");
+  const [uploadedPlanYInput, setUploadedPlanYInput] = useState("0'");
+  const [uploadedPlanWidthInput, setUploadedPlanWidthInput] = useState("320'");
+  const [uploadedPlanHeightInput, setUploadedPlanHeightInput] =
+    useState("420'");
+  const [uploadedPlanOpacity, setUploadedPlanOpacity] = useState(0.45);
+
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewPanX, setPreviewPanX] = useState(0);
+  const [previewPanY, setPreviewPanY] = useState(0);
+
+  // Auto safety symbols
+  const [autoSafetySymbols, setAutoSafetySymbols] = useState<
+    AutoSafetySymbol[]
+  >([]);
+
+  // Occupant load / basic compliance
+  const [occupiableAreaInput, setOccupiableAreaInput] = useState("2000");
+  const [occupantLoadFactorInput, setOccupantLoadFactorInput] = useState("15");
+  const [occupancyClassification, setOccupancyClassification] =
+    useState("Assembly");
+
+  // IDs
+  const [nextWallId, setNextWallId] = useState(1);
+  const [nextDoorId, setNextDoorId] = useState(1);
+  const [nextWindowId, setNextWindowId] = useState(1);
+  const [nextStairId, setNextStairId] = useState(1);
+  const [nextRoomLabelId, setNextRoomLabelId] = useState(1);
+  const [nextExitPathId, setNextExitPathId] = useState(1);
+  const [nextFireId, setNextFireId] = useState(1);
+  const [nextBlockedZoneId, setNextBlockedZoneId] = useState(1);
+
+  const gridSize = 1;
+
+  const wallsById = useMemo(() => {
+    const map = new Map<number, Wall>();
+    for (const wall of walls) {
+      map.set(wall.id, wall);
+    }
+    return map;
+  }, [walls]);
+
+  const youAreHerePoint = useMemo(
+    () => ({
+      x: parseDimension(youAreHereXInput),
+      y: parseDimension(youAreHereYInput),
+    }),
+    [youAreHereXInput, youAreHereYInput]
+  );
+
+  const detectedExitTargets = useMemo(() => {
+    return detectExitTargets({
+      doors,
+      walls,
+      roomLabels,
+    });
+  }, [doors, walls, roomLabels]);
+
+  const occupantLoad = useMemo(() => {
+    const area = Number(occupiableAreaInput || "0");
+    const factor = Number(occupantLoadFactorInput || "15");
+    return calculateOccupantLoad(area, factor);
+  }, [occupiableAreaInput, occupantLoadFactorInput]);
+
+  const exitCountCheck = useMemo(() => {
+    const minimumExits = occupantLoad > 49 ? 2 : 1;
+    return {
+      minimumExits,
+      provided: detectedExitTargets.length,
+      compliant: detectedExitTargets.length >= minimumExits,
+    };
+  }, [detectedExitTargets.length, occupantLoad]);
+
+  const uploadedPlanX = useMemo(
+    () => parseDimension(uploadedPlanXInput),
+    [uploadedPlanXInput]
+  );
+
+  const uploadedPlanY = useMemo(
+    () => parseDimension(uploadedPlanYInput),
+    [uploadedPlanYInput]
+  );
+
+  const uploadedPlanWidth = useMemo(
+    () => Math.max(1, parseDimension(uploadedPlanWidthInput) || planWidth),
+    [uploadedPlanWidthInput, planWidth]
+  );
+
+  const uploadedPlanHeight = useMemo(
+    () => Math.max(1, parseDimension(uploadedPlanHeightInput) || planHeight),
+    [uploadedPlanHeightInput, planHeight]
+  );
+
+  const safeZoom = useMemo(() => clamp(previewZoom, 1, 8), [previewZoom]);
+
+  const previewViewWidth = useMemo(
+    () => planWidth / safeZoom,
+    [planWidth, safeZoom]
+  );
+
+  const previewViewHeight = useMemo(
+    () => planHeight / safeZoom,
+    [planHeight, safeZoom]
+  );
+
+  const maxPreviewPanX = useMemo(
+    () => Math.max(0, planWidth - previewViewWidth),
+    [planWidth, previewViewWidth]
+  );
+
+  const maxPreviewPanY = useMemo(
+    () => Math.max(0, planHeight - previewViewHeight),
+    [planHeight, previewViewHeight]
+  );
+
+  const safePreviewPanX = useMemo(
+    () => clamp(previewPanX, 0, maxPreviewPanX),
+    [previewPanX, maxPreviewPanX]
+  );
+
+  const safePreviewPanY = useMemo(
+    () => clamp(previewPanY, 0, maxPreviewPanY),
+    [previewPanY, maxPreviewPanY]
+  );
+
+  const previewViewBox = useMemo(
+    () =>
+      `${safePreviewPanX} ${safePreviewPanY} ${previewViewWidth} ${previewViewHeight}`,
+    [safePreviewPanX, safePreviewPanY, previewViewWidth, previewViewHeight]
+  );
+
+  function applyIncomingDraft(parsed: any) {
+    if (!parsed) return;
+
+    if (parsed.planWidthInput) setPlanWidthInput(parsed.planWidthInput);
+    if (parsed.planHeightInput) setPlanHeightInput(parsed.planHeightInput);
+    if (parsed.defaultWallThicknessInput) {
+      setDefaultWallThicknessInput(parsed.defaultWallThicknessInput);
+    }
+
+    if (parsed.walls) setWalls(parsed.walls);
+    if (parsed.doors) setDoors(parsed.doors);
+    if (parsed.windows) setWindows(parsed.windows);
+    if (parsed.stairs) setStairs(parsed.stairs);
+    if (parsed.roomLabels) setRoomLabels(parsed.roomLabels);
+    if (parsed.exitPaths) setExitPaths(parsed.exitPaths);
+    if (parsed.fireExtinguishers) setFireExtinguishers(parsed.fireExtinguishers);
+    if (parsed.blockedZones) setBlockedZones(parsed.blockedZones);
+
+    if (parsed.titleBlock) setTitleBlock(parsed.titleBlock);
+
+    if (parsed.logoPlacement) setLogoPlacement(parsed.logoPlacement);
+    if (parsed.logoSizeInput) setLogoSizeInput(parsed.logoSizeInput);
+    if (parsed.logoPaddingInput) setLogoPaddingInput(parsed.logoPaddingInput);
+
+    if (parsed.gridResolutionInput) setGridResolutionInput(parsed.gridResolutionInput);
+    if (parsed.maxTravelDistanceInput) setMaxTravelDistanceInput(parsed.maxTravelDistanceInput);
+    if (parsed.youAreHereXInput) setYouAreHereXInput(parsed.youAreHereXInput);
+    if (parsed.youAreHereYInput) setYouAreHereYInput(parsed.youAreHereYInput);
+
+    if (parsed.occupiableAreaInput) setOccupiableAreaInput(parsed.occupiableAreaInput);
+    if (parsed.occupantLoadFactorInput) setOccupantLoadFactorInput(parsed.occupantLoadFactorInput);
+    if (parsed.occupancyClassification) setOccupancyClassification(parsed.occupancyClassification);
+  }
+
+  const draftPayload = useMemo(() => {
+    return {
+      planWidthInput,
+      planHeightInput,
+      defaultWallThicknessInput,
+      walls,
+      doors,
+      windows,
+      stairs,
+      roomLabels,
+      exitPaths,
+      fireExtinguishers,
+      blockedZones,
+      titleBlock,
+      logoPlacement,
+      logoSizeInput,
+      logoPaddingInput,
+      gridResolutionInput,
+      maxTravelDistanceInput,
+      youAreHereXInput,
+      youAreHereYInput,
+      occupiableAreaInput,
+      occupantLoadFactorInput,
+      occupancyClassification,
+    };
+  }, [
+    planWidthInput,
+    planHeightInput,
+    defaultWallThicknessInput,
+    walls,
+    doors,
+    windows,
+    stairs,
+    roomLabels,
+    exitPaths,
+    fireExtinguishers,
+    blockedZones,
+    titleBlock,
+    logoPlacement,
+    logoSizeInput,
+    logoPaddingInput,
+    gridResolutionInput,
+    maxTravelDistanceInput,
+    youAreHereXInput,
+    youAreHereYInput,
+    occupiableAreaInput,
+    occupantLoadFactorInput,
+    occupancyClassification,
+  ]);
+
+  useEffect(() => {
+    if (!userId || draftHydrated) return;
+
+    const localKey = `efp-draft-${userId}`;
+
+    if (initialDraft) {
+      applyIncomingDraft(initialDraft);
+      setDraftHydrated(true);
+      return;
+    }
+
+    const raw = localStorage.getItem(localKey);
+    if (raw) {
+      try {
+        applyIncomingDraft(JSON.parse(raw));
+      } catch (err) {
+        console.error("Draft restore failed:", err);
+      }
+    }
+
+    setDraftHydrated(true);
+  }, [userId, initialDraft, draftHydrated]);
+
+  useEffect(() => {
+    if (!userId || !draftHydrated) return;
+
+    const localKey = `efp-draft-${userId}`;
+    localStorage.setItem(localKey, JSON.stringify(draftPayload));
+
+    const timer = setTimeout(async () => {
+      try {
+        setAutosaveStatus("saving");
+
+        await setDoc(
+          doc(db, "plans", userId),
+          {
+            draft: draftPayload,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        setAutosaveStatus("saved");
+      } catch (err) {
+        console.error(err);
+        setAutosaveStatus("error");
+      }
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [userId, draftHydrated, draftPayload]);
+
+  useEffect(() => {
+    if (!userId || !draftHydrated) return;
+
+    const handler = async () => {
+      if (document.visibilityState !== "hidden") return;
+
+      try {
+        const localKey = `efp-draft-${userId}`;
+        localStorage.setItem(localKey, JSON.stringify(draftPayload));
+
+        await setDoc(
+          doc(db, "plans", userId),
+          {
+            draft: draftPayload,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [userId, draftHydrated, draftPayload]);
+
+  function addWall() {
+    const start = {
+      x: parseDimension(wallStartXInput),
+      y: parseDimension(wallStartYInput),
+    };
+    const end = {
+      x: parseDimension(wallEndXInput),
+      y: parseDimension(wallEndYInput),
+    };
+    const thickness = parseDimension(wallThicknessInput) || defaultWallThickness;
+
+    if (distance(start, end) <= 0) {
+      alert("Wall must have a non-zero length.");
+      return;
+    }
+
+    const newWall: Wall = {
+      id: nextWallId,
+      start,
+      end,
+      thickness,
+      label: wallLabelInput.trim() || undefined,
+    };
+
+    setWalls((prev) => [...prev, newWall]);
+    setNextWallId((prev) => prev + 1);
+
+    if (doorWallId === 0) setDoorWallId(newWall.id);
+    if (windowWallId === 0) setWindowWallId(newWall.id);
+
+    setWallLabelInput("");
+  }
+
+  function addExteriorWalls() {
+    const t = defaultWallThickness;
+
+    const outer: Wall[] = [
+      {
+        id: nextWallId,
+        start: { x: 0, y: 0 },
+        end: { x: planWidth, y: 0 },
+        thickness: t,
+        label: "Top Exterior Wall",
+      },
+      {
+        id: nextWallId + 1,
+        start: { x: planWidth, y: 0 },
+        end: { x: planWidth, y: planHeight },
+        thickness: t,
+        label: "Right Exterior Wall",
+      },
+      {
+        id: nextWallId + 2,
+        start: { x: planWidth, y: planHeight },
+        end: { x: 0, y: planHeight },
+        thickness: t,
+        label: "Bottom Exterior Wall",
+      },
+      {
+        id: nextWallId + 3,
+        start: { x: 0, y: planHeight },
+        end: { x: 0, y: 0 },
+        thickness: t,
+        label: "Left Exterior Wall",
+      },
+    ];
+
+    setWalls((prev) => [...prev, ...outer]);
+    setNextWallId((prev) => prev + 4);
+
+    if (doorWallId === 0) setDoorWallId(nextWallId);
+    if (windowWallId === 0) setWindowWallId(nextWallId);
+  }
+
+  function deleteWall(id: number) {
+    setWalls((prev) => prev.filter((w) => w.id !== id));
+    setDoors((prev) => prev.filter((d) => d.wallId !== id));
+    setWindows((prev) => prev.filter((w) => w.wallId !== id));
+
+    if (doorWallId === id) setDoorWallId(0);
+    if (windowWallId === id) setWindowWallId(0);
+  }
+
+  function addDoorOrOpening() {
+    const wall = wallsById.get(doorWallId);
+    if (!wall) {
+      alert("Choose a wall first.");
+      return;
+    }
+
+    const offset = parseDimension(doorOffsetInput);
+    const width = parseDimension(doorWidthInput);
+    const len = wallLength(wall);
+
+    if (width <= 0 || offset < 0 || offset + width > len) {
+      alert("Door/opening must fit within the selected wall length.");
+      return;
+    }
+
+    const item: DoorLike = {
+      id: nextDoorId,
+      wallId: doorWallId,
+      offset,
+      width,
+      kind: doorKind,
+      hingeSide: doorHingeSide,
+      swingDirection: doorSwingDirection,
+      inward: doorInward,
+      label: doorLabelInput.trim() || undefined,
+    };
+
+    setDoors((prev) => [...prev, item]);
+    setNextDoorId((prev) => prev + 1);
+    setDoorLabelInput("");
+  }
+
+  function deleteDoor(id: number) {
+    setDoors((prev) => prev.filter((d) => d.id !== id));
+  }
+
+  function addWindow() {
+    const wall = wallsById.get(windowWallId);
+    if (!wall) {
+      alert("Choose a wall first.");
+      return;
+    }
+
+    const offset = parseDimension(windowOffsetInput);
+    const width = parseDimension(windowWidthInput);
+    const len = wallLength(wall);
+
+    if (width <= 0 || offset < 0 || offset + width > len) {
+      alert("Window must fit within the selected wall length.");
+      return;
+    }
+
+    const item: WindowItem = {
+      id: nextWindowId,
+      wallId: windowWallId,
+      offset,
+      width,
+      label: windowLabelInput.trim() || undefined,
+    };
+
+    setWindows((prev) => [...prev, item]);
+    setNextWindowId((prev) => prev + 1);
+    setWindowLabelInput("");
+  }
+
+  function deleteWindow(id: number) {
+    setWindows((prev) => prev.filter((w) => w.id !== id));
+  }
+
+  function addStairs() {
+    const stair: Stair = {
+      id: nextStairId,
+      x: parseDimension(stairXInput),
+      y: parseDimension(stairYInput),
+      width: Math.max(1, parseDimension(stairWidthInput)),
+      height: Math.max(1, parseDimension(stairHeightInput)),
+      steps: Math.max(2, parseInt(stairStepsInput || "2", 10)),
+      direction: stairDirection,
+      label: stairLabelInput.trim() || undefined,
+    };
+
+    setStairs((prev) => [...prev, stair]);
+    setNextStairId((prev) => prev + 1);
+    setStairLabelInput("Stairs");
+  }
+
+  function deleteStair(id: number) {
+    setStairs((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  function addRoomLabel() {
+    const label: RoomLabel = {
+      id: nextRoomLabelId,
+      x: parseDimension(roomLabelXInput),
+      y: parseDimension(roomLabelYInput),
+      text: roomLabelTextInput.trim() || "Room",
+    };
+
+    setRoomLabels((prev) => [...prev, label]);
+    setNextRoomLabelId((prev) => prev + 1);
+  }
+
+  function deleteRoomLabel(id: number) {
+    setRoomLabels((prev) => prev.filter((r) => r.id !== id));
+  }
+
+  function addExitPath() {
+    const points = parsePointList(exitPathPointsInput);
+
+    if (points.length < 2) {
+      alert("Exit path needs at least two points.");
+      return;
+    }
+
+    const path: ExitPath = {
+      id: nextExitPathId,
+      points,
+      label: exitPathLabelInput.trim() || undefined,
+    };
+
+    setExitPaths((prev) => [...prev, path]);
+    setNextExitPathId((prev) => prev + 1);
+  }
+
+  function deleteExitPath(id: number) {
+    setExitPaths((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  function addFireExtinguisher() {
+    const item: FireExtinguisher = {
+      id: nextFireId,
+      x: parseDimension(fireXInput),
+      y: parseDimension(fireYInput),
+      size: Math.max(0.5, parseDimension(fireSizeInput)),
+      label: fireLabelInput.trim() || "FE",
+    };
+
+    setFireExtinguishers((prev) => [...prev, item]);
+    setNextFireId((prev) => prev + 1);
+  }
+
+  function deleteFireExtinguisher(id: number) {
+    setFireExtinguishers((prev) => prev.filter((f) => f.id !== id));
+  }
+
+  function addBlockedZone() {
+    const zone: BlockedZone = {
+      id: nextBlockedZoneId,
+      x: parseDimension(blockedZoneXInput),
+      y: parseDimension(blockedZoneYInput),
+      width: Math.max(1, parseDimension(blockedZoneWidthInput)),
+      height: Math.max(1, parseDimension(blockedZoneHeightInput)),
+      label: blockedZoneLabelInput.trim() || undefined,
+    };
+
+    setBlockedZones((prev) => [...prev, zone]);
+    setNextBlockedZoneId((prev) => prev + 1);
+  }
+
+  function deleteBlockedZone(id: number) {
+    setBlockedZones((prev) => prev.filter((zone) => zone.id !== id));
+  }
+
+  function autoPlaceYouAreHere() {
+    const nonExitLabels = roomLabels.filter(
+      (label) => !/(exit|egress|gate|beach access)/i.test(label.text)
+    );
+
+    if (nonExitLabels.length > 0) {
+      const pick = nonExitLabels[0];
+      setYouAreHereXInput(`${pick.x}'`);
+      setYouAreHereYInput(`${pick.y}'`);
+      setRouteMessage(`Auto-placed "You Are Here" at "${pick.text}".`);
+      return;
+    }
+
+    setYouAreHereXInput(`${Math.round(planWidth / 2)}'`);
+    setYouAreHereYInput(`${Math.round(planHeight / 2)}'`);
+    setRouteMessage(`Auto-placed "You Are Here" at plan center.`);
+  }
+
+  function autoPlaceEmergencyFeatures(
+    bestRoutes: RouteResult[],
+    exits: ExitTarget[]
+  ) {
+    const symbols: AutoSafetySymbol[] = [];
+    let symbolId = 1;
+
+    for (const exit of exits) {
+      symbols.push({
+        id: symbolId++,
+        type: "pull-station",
+        x: exit.point.x + 3,
+        y: exit.point.y,
+        label: "Pull Station",
+      });
+
+      symbols.push({
+        id: symbolId++,
+        type: "emergency-light",
+        x: exit.point.x,
+        y: Math.max(2, exit.point.y - 4),
+        label: "Emergency Light",
+      });
+
+      symbols.push({
+        id: symbolId++,
+        type: "assembly",
+        x: clamp(exit.point.x, 6, planWidth - 6),
+        y: clamp(exit.point.y - 8, 6, planHeight - 6),
+        label: "Assembly Point",
+      });
+    }
+
+    if (bestRoutes.length > 0) {
+      const best = bestRoutes[0];
+      const mid = best.path[Math.floor(best.path.length / 2)] ?? best.path[0];
+
+      if (mid) {
+        symbols.push({
+          id: symbolId++,
+          type: "aed",
+          x: clamp(mid.x - 3, 4, planWidth - 4),
+          y: clamp(mid.y - 2, 4, planHeight - 4),
+          label: "AED",
+        });
+
+        symbols.push({
+          id: symbolId++,
+          type: "first-aid",
+          x: clamp(mid.x + 3, 4, planWidth - 4),
+          y: clamp(mid.y + 2, 4, planHeight - 4),
+          label: "First Aid",
+        });
+      }
+    }
+
+    setAutoSafetySymbols(symbols);
+  }
+
+  function generateSmartEvacuation() {
+    const resolution = Math.max(0.5, parseDimension(gridResolutionInput) || 1);
+    const maxTravelDistance = Math.max(
+      1,
+      parseDimension(maxTravelDistanceInput) || 200
+    );
+
+    if (!detectedExitTargets.length) {
+      alert(
+        'No exits detected. Add a room label like "Exit", "Gate", or "Beach Access Gate", or label a door/opening with the word "Exit".'
+      );
+      return;
+    }
+
+    const grid = buildOccupancyGrid({
+      planWidth,
+      planHeight,
+      walls,
+      doors,
+      blockedZones,
+      resolution,
+      doorwayClearance: 1,
+    });
+
+    const routes = generateRoutes({
+      start: youAreHerePoint,
+      exits: detectedExitTargets,
+      grid,
+      maxRoutes: 3,
+    });
+
+    setAutoRoutes(routes);
+
+    if (!routes.length) {
+      setTravelChecks([]);
+      setRouteMessage(
+        "No walkable route found. Check your blocked zones, wall openings, and exit labels."
+      );
+      setAutoSafetySymbols([]);
+      return;
+    }
+
+    const checks: TravelCheck[] = routes.map((route) => ({
+      exitLabel: route.exitLabel,
+      distance: route.distance,
+      compliant: route.distance <= maxTravelDistance,
+    }));
+
+    setTravelChecks(checks);
+
+    const allCompliant = checks.every((check) => check.compliant);
+    setRouteMessage(
+      `Generated ${routes.length} route(s). Best route: ${routes[0].exitLabel}. ${
+        allCompliant
+          ? "Travel distance is within the current limit."
+          : "One or more routes exceed the current travel-distance limit."
+      }`
+    );
+
+    autoPlaceEmergencyFeatures(routes, detectedExitTargets);
+  }
+
+  function handleLogoUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setLogoDataUrl(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleUploadedPlanFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setUploadedPlanDataUrl(reader.result);
+        setShowUploadedPlan(true);
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function fitUploadedPlanToCanvas() {
+    setUploadedPlanXInput("0'");
+    setUploadedPlanYInput("0'");
+    setUploadedPlanWidthInput(`${planWidth}'`);
+    setUploadedPlanHeightInput(`${planHeight}'`);
+  }
+
+  function clearUploadedPlan() {
+    setUploadedPlanDataUrl("");
+  }
+
+  function setZoomKeepingCenter(nextZoom: number) {
+    const clampedZoom = clamp(nextZoom, 1, 8);
+
+    const currentViewWidth = planWidth / safeZoom;
+    const currentViewHeight = planHeight / safeZoom;
+
+    const currentCenterX = safePreviewPanX + currentViewWidth / 2;
+    const currentCenterY = safePreviewPanY + currentViewHeight / 2;
+
+    const nextViewWidth = planWidth / clampedZoom;
+    const nextViewHeight = planHeight / clampedZoom;
+
+    const nextPanX = clamp(
+      currentCenterX - nextViewWidth / 2,
+      0,
+      Math.max(0, planWidth - nextViewWidth)
+    );
+
+    const nextPanY = clamp(
+      currentCenterY - nextViewHeight / 2,
+      0,
+      Math.max(0, planHeight - nextViewHeight)
+    );
+
+    setPreviewZoom(clampedZoom);
+    setPreviewPanX(nextPanX);
+    setPreviewPanY(nextPanY);
+  }
+
+  function zoomInPreview() {
+    setZoomKeepingCenter(safeZoom * 1.25);
+  }
+
+  function zoomOutPreview() {
+    setZoomKeepingCenter(safeZoom / 1.25);
+  }
+
+  function resetPreviewZoom() {
+    setPreviewZoom(1);
+    setPreviewPanX(0);
+    setPreviewPanY(0);
+  }
+
+  function panPreview(dx: number, dy: number) {
+    setPreviewPanX((prev) => prev + dx);
+    setPreviewPanY((prev) => prev + dy);
+  }
+
+  function handlePreviewWheel(e: React.WheelEvent<HTMLDivElement>) {
+    e.preventDefault();
+
+    if (e.deltaY < 0) {
+      zoomInPreview();
+    } else {
+      zoomOutPreview();
+    }
+  }
+
+  function clearAll() {
+    setWalls([]);
+    setDoors([]);
+    setWindows([]);
+    setStairs([]);
+    setRoomLabels([]);
+    setExitPaths([]);
+    setFireExtinguishers([]);
+    setBlockedZones([]);
+    setAutoRoutes([]);
+    setTravelChecks([]);
+    setRouteMessage("");
+    setAutoSafetySymbols([]);
+
+    setNextWallId(1);
+    setNextDoorId(1);
+    setNextWindowId(1);
+    setNextStairId(1);
+    setNextRoomLabelId(1);
+    setNextExitPathId(1);
+    setNextFireId(1);
+    setNextBlockedZoneId(1);
+
+    setDoorWallId(0);
+    setWindowWallId(0);
+  }
+
+  function downloadSvg() {
+    if (!svgRef.current) return;
+
+    const serializer = new XMLSerializer();
+    let source = serializer.serializeToString(svgRef.current);
+
+    if (!source.includes('xmlns="http://www.w3.org/2000/svg"')) {
+      source = source.replace(
+        "<svg",
+        '<svg xmlns="http://www.w3.org/2000/svg"'
+      );
+    }
+
+    const blob = new Blob(
+      ['<?xml version="1.0" standalone="no"?>\n' + source],
+      { type: "image/svg+xml;charset=utf-8" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "efp-floor-plan.svg";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const gridLines = useMemo(() => {
+    const lines = [];
+
+    for (let x = 0; x <= planWidth; x += gridSize) {
+      lines.push(
+        <line
+          key={`vx-${x}`}
+          x1={x}
+          y1={0}
+          x2={x}
+          y2={planHeight}
+          stroke="#e5e7eb"
+          strokeWidth={0.03}
+        />
+      );
+    }
+
+    for (let y = 0; y <= planHeight; y += gridSize) {
+      lines.push(
+        <line
+          key={`hy-${y}`}
+          x1={0}
+          y1={y}
+          x2={planWidth}
+          y2={y}
+          stroke="#e5e7eb"
+          strokeWidth={0.03}
+        />
+      );
+    }
+
+    return lines;
+  }, [planWidth, planHeight]);
+
+  function renderWallLabel(wall: Wall) {
+    if (!wall.label) return null;
+    const m = midpoint(wall.start, wall.end);
+
+    return (
+      <text
+        x={m.x}
+        y={m.y}
+        fontSize={0.8}
+        fill="#ffffff"
+        textAnchor="middle"
+        dominantBaseline="middle"
+        pointerEvents="none"
+      >
+        {wall.label}
+      </text>
+    );
+  }
+
+  function renderDoorOrOpening(item: DoorLike) {
+    const wall = wallsById.get(item.wallId);
+    if (!wall) return null;
+
+    const len = wallLength(wall);
+    if (item.offset + item.width > len) return null;
+
+    const { ux, uy } = normalizeVector(wall.start, wall.end);
+    const px = -uy;
+    const py = ux;
+
+    const gapStart = pointAtOffsetOnWall(wall, item.offset);
+    const gapEnd = pointAtOffsetOnWall(wall, item.offset + item.width);
+
+    const hinge = item.hingeSide === "start" ? gapStart : gapEnd;
+    const closedEnd = item.hingeSide === "start" ? gapEnd : gapStart;
+
+    const baseSign = item.swingDirection === "left" ? 1 : -1;
+    const inwardSign = item.inward ? 1 : -1;
+    const swingSign = baseSign * inwardSign;
+
+    const openEnd = {
+      x: hinge.x + px * swingSign * item.width,
+      y: hinge.y + py * swingSign * item.width,
+    };
+
+    const arcSweep = swingSign > 0 ? 1 : 0;
+    const labelPoint = midpoint(gapStart, gapEnd);
+
+    return (
+      <g key={`door-${item.id}`}>
+        <line
+          x1={gapStart.x}
+          y1={gapStart.y}
+          x2={gapEnd.x}
+          y2={gapEnd.y}
+          stroke="#f8fafc"
+          strokeWidth={wall.thickness + 0.18}
+          strokeLinecap="round"
+        />
+
+        {item.kind === "door" && (
+          <>
+            <line
+              x1={hinge.x}
+              y1={hinge.y}
+              x2={openEnd.x}
+              y2={openEnd.y}
+              stroke="#111827"
+              strokeWidth={0.08}
+            />
+            <path
+              d={`M ${closedEnd.x} ${closedEnd.y} A ${item.width} ${item.width} 0 0 ${arcSweep} ${openEnd.x} ${openEnd.y}`}
+              fill="none"
+              stroke="#111827"
+              strokeWidth={0.05}
+              strokeDasharray="0.25 0.25"
+            />
+          </>
+        )}
+
+        {item.label && (
+          <text
+            x={labelPoint.x}
+            y={labelPoint.y - 0.8}
+            fontSize={0.6}
+            fill="#111827"
+            textAnchor="middle"
+          >
+            {item.label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderWindow(item: WindowItem) {
+    const wall = wallsById.get(item.wallId);
+    if (!wall) return null;
+
+    const len = wallLength(wall);
+    if (item.offset + item.width > len) return null;
+
+    const start = pointAtOffsetOnWall(wall, item.offset);
+    const end = pointAtOffsetOnWall(wall, item.offset + item.width);
+    const labelPoint = midpoint(start, end);
+
+    return (
+      <g key={`window-${item.id}`}>
+        <line
+          x1={start.x}
+          y1={start.y}
+          x2={end.x}
+          y2={end.y}
+          stroke="#dbeafe"
+          strokeWidth={wall.thickness + 0.1}
+          strokeLinecap="round"
+        />
+        <line
+          x1={start.x}
+          y1={start.y}
+          x2={end.x}
+          y2={end.y}
+          stroke="#2563eb"
+          strokeWidth={Math.max(0.12, wall.thickness * 0.35)}
+          strokeLinecap="round"
+        />
+        {item.label && (
+          <text
+            x={labelPoint.x}
+            y={labelPoint.y - 0.8}
+            fontSize={0.6}
+            fill="#1d4ed8"
+            textAnchor="middle"
+          >
+            {item.label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderStair(stair: Stair) {
+    const steps = [];
+    const horizontal = stair.width >= stair.height;
+
+    for (let i = 1; i < stair.steps; i++) {
+      const ratio = i / stair.steps;
+
+      if (horizontal) {
+        const x = stair.x + stair.width * ratio;
+        steps.push(
+          <line
+            key={`stair-step-${stair.id}-${i}`}
+            x1={x}
+            y1={stair.y}
+            x2={x}
+            y2={stair.y + stair.height}
+            stroke="#475569"
+            strokeWidth={0.08}
+          />
+        );
+      } else {
+        const y = stair.y + stair.height * ratio;
+        steps.push(
+          <line
+            key={`stair-step-${stair.id}-${i}`}
+            x1={stair.x}
+            y1={y}
+            x2={stair.x + stair.width}
+            y2={y}
+            stroke="#475569"
+            strokeWidth={0.08}
+          />
+        );
+      }
+    }
+
+    const arrowStart = horizontal
+      ? { x: stair.x + 0.8, y: stair.y + stair.height / 2 }
+      : { x: stair.x + stair.width / 2, y: stair.y + stair.height - 0.8 };
+
+    const arrowEnd = horizontal
+      ? stair.direction === "up"
+        ? { x: stair.x + stair.width - 0.8, y: stair.y + stair.height / 2 }
+        : { x: stair.x + 0.8, y: stair.y + stair.height / 2 }
+      : stair.direction === "up"
+      ? { x: stair.x + stair.width / 2, y: stair.y + 0.8 }
+      : { x: stair.x + stair.width / 2, y: stair.y + stair.height - 0.8 };
+
+    return (
+      <g key={`stair-${stair.id}`}>
+        <rect
+          x={stair.x}
+          y={stair.y}
+          width={stair.width}
+          height={stair.height}
+          fill="#ffffff"
+          stroke="#334155"
+          strokeWidth={0.12}
+          rx={0.15}
+        />
+        {steps}
+        <line
+          x1={arrowStart.x}
+          y1={arrowStart.y}
+          x2={arrowEnd.x}
+          y2={arrowEnd.y}
+          stroke="#0f172a"
+          strokeWidth={0.15}
+          markerEnd="url(#exit-arrow)"
+        />
+        {stair.label && (
+          <text
+            x={stair.x + stair.width / 2}
+            y={stair.y + stair.height / 2}
+            fontSize={0.75}
+            fill="#0f172a"
+            textAnchor="middle"
+            dominantBaseline="middle"
+          >
+            {stair.label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderRoomLabel(label: RoomLabel) {
+    return (
+      <text
+        key={`room-label-${label.id}`}
+        x={label.x}
+        y={label.y}
+        fontSize={1.05}
+        fill="#111827"
+        textAnchor="middle"
+        fontWeight="600"
+      >
+        {label.text}
+      </text>
+    );
+  }
+
+  function renderExitPath(path: ExitPath) {
+    if (path.points.length < 2) return null;
+    const end = path.points[path.points.length - 1];
+
+    return (
+      <g key={`exit-path-${path.id}`}>
+        <polyline
+          points={pointsToSvgString(path.points)}
+          fill="none"
+          stroke="#16a34a"
+          strokeWidth={0.35}
+          strokeDasharray="0.9 0.45"
+          markerEnd="url(#exit-arrow)"
+        />
+        <circle
+          cx={path.points[0].x}
+          cy={path.points[0].y}
+          r={0.35}
+          fill="#16a34a"
+        />
+        <text
+          x={end.x}
+          y={end.y - 1}
+          fontSize={0.75}
+          fill="#166534"
+          textAnchor="middle"
+          fontWeight="700"
+        >
+          {path.label || "EXIT"}
+        </text>
+      </g>
+    );
+  }
+
+  function renderFireExtinguisher(item: FireExtinguisher) {
+    const size = item.size;
+    const scale = size / 10;
+
+    return (
+      <g
+        key={`fire-${item.id}`}
+        transform={`translate(${item.x - size / 2} ${item.y - size / 2}) scale(${scale})`}
+      >
+        <rect
+          x="2.5"
+          y="2"
+          width="4"
+          height="6"
+          rx="1.2"
+          fill="#dc2626"
+          stroke="#7f1d1d"
+          strokeWidth="0.5"
+        />
+        <rect x="4" y="1.1" width="1.3" height="1.2" fill="#7f1d1d" />
+        <path
+          d="M6.5 2.5 C8.2 2.2 8.8 3 8.9 4.4"
+          fill="none"
+          stroke="#7f1d1d"
+          strokeWidth="0.6"
+        />
+        <circle cx="4.6" cy="5.2" r="1.15" fill="#ffffff" />
+        <text
+          x="4.6"
+          y="5.55"
+          fontSize="1.3"
+          textAnchor="middle"
+          fill="#dc2626"
+          fontWeight="700"
+        >
+          F
+        </text>
+        {item.label && (
+          <text
+            x="4.5"
+            y="9.6"
+            fontSize="1.1"
+            textAnchor="middle"
+            fill="#7f1d1d"
+            fontWeight="700"
+          >
+            {item.label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderBlockedZones() {
+    return blockedZones.map((zone) => (
+      <g key={`blocked-zone-${zone.id}`}>
+        <rect
+          x={zone.x}
+          y={zone.y}
+          width={zone.width}
+          height={zone.height}
+          fill="rgba(220, 38, 38, 0.18)"
+          stroke="#dc2626"
+          strokeWidth={0.18}
+          strokeDasharray="0.8 0.4"
+        />
+        {zone.label && (
+          <text
+            x={zone.x + zone.width / 2}
+            y={zone.y + zone.height / 2}
+            fontSize={0.75}
+            textAnchor="middle"
+            dominantBaseline="middle"
+            fill="#7f1d1d"
+            fontWeight="700"
+          >
+            {zone.label}
+          </text>
+        )}
+      </g>
+    ));
+  }
+
+  function renderAutoRoutes() {
+    const colors = ["#16a34a", "#f59e0b", "#8b5cf6"];
+
+    return autoRoutes.map((route, index) => (
+      <g key={`auto-route-${index}`}>
+        <polyline
+          points={route.path.map((p) => `${p.x},${p.y}`).join(" ")}
+          fill="none"
+          stroke={colors[index] || "#16a34a"}
+          strokeWidth={0.55}
+          strokeDasharray={index === 0 ? "none" : "1.1 0.6"}
+          markerEnd="url(#exit-arrow)"
+        />
+        <text
+          x={route.path[route.path.length - 1]?.x ?? 0}
+          y={(route.path[route.path.length - 1]?.y ?? 0) - 1.6}
+          fontSize={0.75}
+          textAnchor="middle"
+          fill={colors[index] || "#16a34a"}
+          fontWeight="700"
+        >
+          {index === 0 ? "BEST ROUTE" : `ALT ${index}`}
+        </text>
+      </g>
+    ));
+  }
+
+  function renderYouAreHere() {
+    return (
+      <g>
+        <circle
+          cx={youAreHerePoint.x}
+          cy={youAreHerePoint.y}
+          r={1.6}
+          fill="#facc15"
+          stroke="#111827"
+          strokeWidth={0.18}
+        />
+        <circle
+          cx={youAreHerePoint.x}
+          cy={youAreHerePoint.y}
+          r={0.55}
+          fill="#111827"
+        />
+        <text
+          x={youAreHerePoint.x}
+          y={youAreHerePoint.y - 2.4}
+          fontSize={0.95}
+          fontWeight="700"
+          textAnchor="middle"
+          fill="#111827"
+        >
+          YOU ARE HERE
+        </text>
+      </g>
+    );
+  }
+
+  function renderExitIcon(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <rect
+          x={x - 2.2}
+          y={y - 1.1}
+          width={4.4}
+          height={2.2}
+          rx={0.25}
+          fill="#16a34a"
+          stroke="#14532d"
+          strokeWidth={0.1}
+        />
+        <text
+          x={x}
+          y={y + 0.3}
+          fontSize={0.7}
+          fill="#ffffff"
+          fontWeight="700"
+          textAnchor="middle"
+        >
+          EXIT
+        </text>
+        {label && (
+          <text
+            x={x}
+            y={y - 1.8}
+            fontSize={0.55}
+            textAnchor="middle"
+            fill="#166534"
+            fontWeight="700"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderDetectedExits() {
+    return detectedExitTargets.map((exit, index) => (
+      <g key={`detected-exit-${index}`}>
+        {renderExitIcon(exit.point.x, exit.point.y, exit.label)}
+      </g>
+    ));
+  }
+
+  function renderPullStation(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <rect
+          x={x - 1.1}
+          y={y - 1.1}
+          width={2.2}
+          height={2.2}
+          rx={0.2}
+          fill="#dc2626"
+          stroke="#7f1d1d"
+          strokeWidth={0.12}
+        />
+        <text
+          x={x}
+          y={y + 0.35}
+          fontSize={0.72}
+          textAnchor="middle"
+          fill="#ffffff"
+          fontWeight="700"
+        >
+          P
+        </text>
+        {label && (
+          <text
+            x={x}
+            y={y + 2.2}
+            fontSize={0.48}
+            textAnchor="middle"
+            fill="#7f1d1d"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderEmergencyLight(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <rect
+          x={x - 1.2}
+          y={y - 0.45}
+          width={2.4}
+          height={0.9}
+          rx={0.15}
+          fill="#0f172a"
+        />
+        <circle
+          cx={x - 0.65}
+          cy={y + 0.95}
+          r={0.28}
+          fill="#f8fafc"
+          stroke="#334155"
+          strokeWidth={0.06}
+        />
+        <circle
+          cx={x + 0.65}
+          cy={y + 0.95}
+          r={0.28}
+          fill="#f8fafc"
+          stroke="#334155"
+          strokeWidth={0.06}
+        />
+        {label && (
+          <text
+            x={x}
+            y={y - 1.1}
+            fontSize={0.45}
+            textAnchor="middle"
+            fill="#0f172a"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderAED(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <rect
+          x={x - 1.35}
+          y={y - 1.1}
+          width={2.7}
+          height={2.2}
+          rx={0.3}
+          fill="#10b981"
+          stroke="#065f46"
+          strokeWidth={0.12}
+        />
+        <path
+          d={`M ${x - 0.5} ${y} C ${x - 0.75} ${y - 0.5}, ${x - 1.05} ${y - 0.25}, ${x - 1.05} ${y + 0.15}
+              C ${x - 1.05} ${y + 0.7}, ${x - 0.45} ${y + 0.95}, ${x} ${y + 1.15}
+              C ${x + 0.45} ${y + 0.95}, ${x + 1.05} ${y + 0.7}, ${x + 1.05} ${y + 0.15}
+              C ${x + 1.05} ${y - 0.25}, ${x + 0.75} ${y - 0.5}, ${x + 0.5} ${y}
+              C ${x + 0.2} ${y - 0.5}, ${x - 0.2} ${y - 0.5}, ${x - 0.5} ${y} Z`}
+          fill="#ffffff"
+        />
+        {label && (
+          <text
+            x={x}
+            y={y + 2.0}
+            fontSize={0.45}
+            textAnchor="middle"
+            fill="#065f46"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderFirstAid(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <rect
+          x={x - 1.25}
+          y={y - 1.25}
+          width={2.5}
+          height={2.5}
+          rx={0.3}
+          fill="#22c55e"
+          stroke="#166534"
+          strokeWidth={0.12}
+        />
+        <rect
+          x={x - 0.22}
+          y={y - 0.8}
+          width={0.44}
+          height={1.6}
+          fill="#ffffff"
+        />
+        <rect
+          x={x - 0.8}
+          y={y - 0.22}
+          width={1.6}
+          height={0.44}
+          fill="#ffffff"
+        />
+        {label && (
+          <text
+            x={x}
+            y={y + 2.0}
+            fontSize={0.45}
+            textAnchor="middle"
+            fill="#166534"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderAssemblyPoint(x: number, y: number, label?: string) {
+    return (
+      <g>
+        <circle
+          cx={x}
+          cy={y}
+          r={1.25}
+          fill="#dbeafe"
+          stroke="#1d4ed8"
+          strokeWidth={0.12}
+        />
+        <path
+          d={`M ${x} ${y - 0.7} L ${x} ${y + 0.15}`}
+          stroke="#1d4ed8"
+          strokeWidth={0.15}
+        />
+        <path
+          d={`M ${x - 0.35} ${y - 0.2} L ${x} ${y + 0.15} L ${x + 0.35} ${y - 0.2}`}
+          fill="none"
+          stroke="#1d4ed8"
+          strokeWidth={0.15}
+        />
+        {label && (
+          <text
+            x={x}
+            y={y + 2.0}
+            fontSize={0.45}
+            textAnchor="middle"
+            fill="#1d4ed8"
+          >
+            {label}
+          </text>
+        )}
+      </g>
+    );
+  }
+
+  function renderAutoSafetySymbols() {
+    return autoSafetySymbols.map((item) => {
+      if (item.type === "pull-station") {
+        return (
+          <g key={item.id}>
+            {renderPullStation(item.x, item.y, item.label)}
+          </g>
+        );
+      }
+      if (item.type === "emergency-light") {
+        return (
+          <g key={item.id}>
+            {renderEmergencyLight(item.x, item.y, item.label)}
+          </g>
+        );
+      }
+      if (item.type === "aed") {
+        return (
+          <g key={item.id}>{renderAED(item.x, item.y, item.label)}</g>
+        );
+      }
+      if (item.type === "first-aid") {
+        return (
+          <g key={item.id}>
+            {renderFirstAid(item.x, item.y, item.label)}
+          </g>
+        );
+      }
+      if (item.type === "assembly") {
+        return (
+          <g key={item.id}>
+            {renderAssemblyPoint(item.x, item.y, item.label)}
+          </g>
+        );
+      }
+      return null;
+    });
+  }
+
+  function renderLegend() {
+    const baseItems = [
+      { key: "exit", label: "Exit" },
+      { key: "you", label: "You Are Here" },
+      { key: "best", label: "Best Route" },
+    ];
+
+    const extraKeys = new Set(autoSafetySymbols.map((s) => s.type));
+
+    const dynamicItems = [];
+    if (extraKeys.has("assembly")) {
+      dynamicItems.push({ key: "assembly", label: "Assembly Point" });
+    }
+    if (extraKeys.has("first-aid")) {
+      dynamicItems.push({ key: "first-aid", label: "First Aid" });
+    }
+    if (extraKeys.has("aed")) {
+      dynamicItems.push({ key: "aed", label: "AED" });
+    }
+    if (extraKeys.has("pull-station")) {
+      dynamicItems.push({ key: "pull-station", label: "Pull Station" });
+    }
+    if (extraKeys.has("emergency-light")) {
+      dynamicItems.push({ key: "emergency-light", label: "Emergency Light" });
+    }
+    if (blockedZones.length > 0) {
+      dynamicItems.push({ key: "blocked", label: "Blocked / Hazard Zone" });
+    }
+    if (autoRoutes.length > 1) {
+      dynamicItems.push({ key: "alt", label: "Alternate Route" });
+    }
+
+    const items = [...baseItems, ...dynamicItems];
+    const x = 8;
+    const y = 8;
+    const rowHeight = 3.1;
+    const width = 48;
+    const height = 4 + items.length * rowHeight;
+
+    return (
+      <g>
+        <rect
+          x={x}
+          y={y}
+          width={width}
+          height={height}
+          fill="#ffffff"
+          stroke="#111827"
+          strokeWidth={0.12}
+          rx={0.35}
+        />
+        <text
+          x={x + 2}
+          y={y + 2.6}
+          fontSize={0.9}
+          fontWeight="700"
+          fill="#111827"
+        >
+          Legend
+        </text>
+
+        {items.map((item, index) => {
+          const rowY = y + 5 + index * rowHeight;
+
+          return (
+            <g key={item.key}>
+              {item.key === "exit" && (
+                <>
+                  <rect
+                    x={x + 2}
+                    y={rowY - 1.05}
+                    width={4.2}
+                    height={2.1}
+                    rx={0.22}
+                    fill="#16a34a"
+                  />
+                  <text
+                    x={x + 4.1}
+                    y={rowY + 0.35}
+                    fontSize={0.55}
+                    fill="#ffffff"
+                    textAnchor="middle"
+                    fontWeight="700"
+                  >
+                    EXIT
+                  </text>
+                </>
+              )}
+
+              {item.key === "you" && (
+                <>
+                  <circle
+                    cx={x + 4.1}
+                    cy={rowY}
+                    r={1.1}
+                    fill="#facc15"
+                    stroke="#111827"
+                    strokeWidth={0.12}
+                  />
+                  <circle cx={x + 4.1} cy={rowY} r={0.35} fill="#111827" />
+                </>
+              )}
+
+              {item.key === "best" && (
+                <line
+                  x1={x + 2}
+                  y1={rowY}
+                  x2={x + 6.2}
+                  y2={rowY}
+                  stroke="#16a34a"
+                  strokeWidth={0.45}
+                />
+              )}
+
+              {item.key === "alt" && (
+                <line
+                  x1={x + 2}
+                  y1={rowY}
+                  x2={x + 6.2}
+                  y2={rowY}
+                  stroke="#f59e0b"
+                  strokeWidth={0.45}
+                  strokeDasharray="1 0.5"
+                />
+              )}
+
+              {item.key === "assembly" && (
+                <circle
+                  cx={x + 4.1}
+                  cy={rowY}
+                  r={1.05}
+                  fill="#dbeafe"
+                  stroke="#1d4ed8"
+                  strokeWidth={0.12}
+                />
+              )}
+
+              {item.key === "first-aid" && (
+                <>
+                  <rect
+                    x={x + 3.1}
+                    y={rowY - 1}
+                    width={2}
+                    height={2}
+                    rx={0.2}
+                    fill="#22c55e"
+                  />
+                  <rect
+                    x={x + 3.95}
+                    y={rowY - 0.62}
+                    width={0.3}
+                    height={1.24}
+                    fill="#ffffff"
+                  />
+                  <rect
+                    x={x + 3.48}
+                    y={rowY - 0.15}
+                    width={1.24}
+                    height={0.3}
+                    fill="#ffffff"
+                  />
+                </>
+              )}
+
+              {item.key === "aed" && (
+                <rect
+                  x={x + 3.0}
+                  y={rowY - 1}
+                  width={2.2}
+                  height={2}
+                  rx={0.25}
+                  fill="#10b981"
+                />
+              )}
+
+              {item.key === "pull-station" && (
+                <rect
+                  x={x + 3.1}
+                  y={rowY - 1}
+                  width={2}
+                  height={2}
+                  rx={0.2}
+                  fill="#dc2626"
+                />
+              )}
+
+              {item.key === "emergency-light" && (
+                <rect
+                  x={x + 3.0}
+                  y={rowY - 0.35}
+                  width={2.2}
+                  height={0.7}
+                  rx={0.1}
+                  fill="#0f172a"
+                />
+              )}
+
+              {item.key === "blocked" && (
+                <rect
+                  x={x + 2}
+                  y={rowY - 1}
+                  width={4.2}
+                  height={2}
+                  fill="rgba(220, 38, 38, 0.18)"
+                  stroke="#dc2626"
+                  strokeWidth={0.12}
+                  strokeDasharray="0.4 0.2"
+                />
+              )}
+
+              <text
+                x={x + 8.2}
+                y={rowY + 0.35}
+                fontSize={0.72}
+                fill="#111827"
+              >
+                {item.label}
+              </text>
+            </g>
+          );
+        })}
+      </g>
+    );
+  }
+
+  function getLogoPosition() {
+    const size = clamp(parseDimension(logoSizeInput) || 8, 1, 30);
+    const pad = Math.max(0, parseDimension(logoPaddingInput) || 1);
+
+    let x = pad;
+    let y = pad;
+
+    if (logoPlacement === "top-center") {
+      x = (planWidth - size) / 2;
+      y = pad;
+    } else if (logoPlacement === "top-right") {
+      x = planWidth - size - pad;
+      y = pad;
+    } else if (logoPlacement === "bottom-left") {
+      x = pad;
+      y = planHeight - size - pad;
+    } else if (logoPlacement === "bottom-center") {
+      x = (planWidth - size) / 2;
+      y = planHeight - size - pad;
+    } else if (logoPlacement === "bottom-right") {
+      x = planWidth - size - pad;
+      y = planHeight - size - pad;
+    }
+
+    return { x, y, size };
+  }
+
+  function renderLogo() {
+    if (!logoDataUrl) return null;
+    const pos = getLogoPosition();
+
+    return (
+      <image
+        href={logoDataUrl}
+        x={pos.x}
+        y={pos.y}
+        width={pos.size}
+        height={pos.size}
+        preserveAspectRatio="xMidYMid meet"
+      />
+    );
+  }
+
+  function renderTitleBlock() {
+    const blockWidth = Math.min(26, Math.max(18, planWidth * 0.3));
+    const blockHeight = 11;
+    const x = Math.max(0.5, planWidth - blockWidth - 0.75);
+    const y = Math.max(0.5, planHeight - blockHeight - 0.75);
+
+    const rows = [
+      ["Project", titleBlock.projectTitle],
+      ["Building", titleBlock.buildingName],
+      ["Floor", titleBlock.floorName],
+      ["Drawn By", titleBlock.drawnBy],
+      ["Date", titleBlock.date],
+      ["Revision", titleBlock.revision],
+      ["Occ Load", String(occupantLoad || 0)],
+    ] as const;
+
+    const rowHeight = blockHeight / rows.length;
+
+    return (
+      <g>
+        <rect
+          x={x}
+          y={y}
+          width={blockWidth}
+          height={blockHeight}
+          fill="#ffffff"
+          stroke="#111827"
+          strokeWidth={0.12}
+        />
+        {rows.map(([label, value], index) => {
+          const rowY = y + rowHeight * index;
+          return (
+            <g key={label}>
+              {index > 0 && (
+                <line
+                  x1={x}
+                  y1={rowY}
+                  x2={x + blockWidth}
+                  y2={rowY}
+                  stroke="#cbd5e1"
+                  strokeWidth={0.04}
+                />
+              )}
+              <line
+                x1={x + blockWidth * 0.32}
+                y1={rowY}
+                x2={x + blockWidth * 0.32}
+                y2={rowY + rowHeight}
+                stroke="#cbd5e1"
+                strokeWidth={0.04}
+              />
+              <text
+                x={x + 0.45}
+                y={rowY + rowHeight * 0.62}
+                fontSize={0.55}
+                fill="#334155"
+              >
+                {label}
+              </text>
+              <text
+                x={x + blockWidth * 0.34}
+                y={rowY + rowHeight * 0.62}
+                fontSize={0.55}
+                fill="#0f172a"
+                fontWeight="700"
+              >
+                {value}
+              </text>
+            </g>
+          );
+        })}
+      </g>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-6 p-4 lg:grid-cols-[440px_1fr]">
+      <div className="space-y-6 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+        <div>
+          <h2 className="text-2xl font-bold">
+            EFP - Full Floor / Evacuation Builder
+          </h2>
+          <p className="mt-1 text-sm text-gray-600">
+            Draw the plan, place openings and labels, then generate smart
+            evacuation routes and safety graphics.
+          </p>
+
+          {userId ? (
+            <div className="mt-3 rounded-xl bg-gray-50 p-3 text-sm">
+              Autosave status: <strong>{autosaveStatus}</strong>
+            </div>
+          ) : null}
+        </div>
+
+        <section className="space-y-3">
+          <h3 className="text-lg font-semibold">1) Plan Settings</h3>
+
+          <div className="grid grid-cols-1 gap-3">
+            <label className="text-sm">
+              Plan Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={planWidthInput}
+                onChange={(e) => setPlanWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Plan Height
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={planHeightInput}
+                onChange={(e) => setPlanHeightInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Default Wall Thickness
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={defaultWallThicknessInput}
+                onChange={(e) => setDefaultWallThicknessInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="rounded-xl bg-gray-50 p-3 text-sm">
+            Current plan size: <strong>{formatFeet(planWidth)}</strong> ×{" "}
+            <strong>{formatFeet(planHeight)}</strong>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              className="rounded-xl bg-black px-4 py-2 text-white"
+              onClick={addExteriorWalls}
+              type="button"
+            >
+              Add Exterior Walls
+            </button>
+
+            <button
+              className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900"
+              onClick={clearAll}
+              type="button"
+            >
+              Clear All
+            </button>
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">2) Walls (Straight or Angled)</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              Start X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallStartXInput}
+                onChange={(e) => setWallStartXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Start Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallStartYInput}
+                onChange={(e) => setWallStartYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              End X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallEndXInput}
+                onChange={(e) => setWallEndXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              End Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallEndYInput}
+                onChange={(e) => setWallEndYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Thickness
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallThicknessInput}
+                onChange={(e) => setWallThicknessInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={wallLabelInput}
+                onChange={(e) => setWallLabelInput(e.target.value)}
+                placeholder="Conference Wall"
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-blue-600 px-4 py-2 text-white"
+            onClick={addWall}
+            type="button"
+          >
+            Add Wall
+          </button>
+
+          <div className="max-h-44 space-y-2 overflow-auto">
+            {walls.length === 0 ? (
+              <p className="text-sm text-gray-500">No walls yet.</p>
+            ) : (
+              walls.map((wall) => (
+                <div key={wall.id} className="rounded-xl border p-3 text-sm">
+                  <div className="font-semibold">
+                    {wall.label || `Wall ${wall.id}`}
+                  </div>
+                  <div>
+                    Start: {formatFeet(wall.start.x)}, {formatFeet(wall.start.y)}
+                  </div>
+                  <div>
+                    End: {formatFeet(wall.end.x)}, {formatFeet(wall.end.y)}
+                  </div>
+                  <div>Length: {formatFeet(wallLength(wall))}</div>
+                  <div>Thickness: {formatFeet(wall.thickness)}</div>
+                  <button
+                    className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                    onClick={() => deleteWall(wall.id)}
+                    type="button"
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">3) Doors & Openings</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="col-span-2 text-sm">
+              Wall
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorWallId}
+                onChange={(e) => setDoorWallId(Number(e.target.value))}
+              >
+                <option value={0}>Select a wall</option>
+                {walls.map((wall) => (
+                  <option key={wall.id} value={wall.id}>
+                    {wall.label || `Wall ${wall.id}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="text-sm">
+              Offset From Wall Start
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorOffsetInput}
+                onChange={(e) => setDoorOffsetInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorWidthInput}
+                onChange={(e) => setDoorWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Type
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorKind}
+                onChange={(e) =>
+                  setDoorKind(e.target.value as "door" | "opening")
+                }
+              >
+                <option value="door">Door</option>
+                <option value="opening">Opening</option>
+              </select>
+            </label>
+
+            <label className="text-sm">
+              Hinge Side
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorHingeSide}
+                onChange={(e) =>
+                  setDoorHingeSide(e.target.value as "start" | "end")
+                }
+              >
+                <option value="start">Start</option>
+                <option value="end">End</option>
+              </select>
+            </label>
+
+            <label className="text-sm">
+              Swing Direction
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorSwingDirection}
+                onChange={(e) =>
+                  setDoorSwingDirection(e.target.value as "left" | "right")
+                }
+              >
+                <option value="left">Left</option>
+                <option value="right">Right</option>
+              </select>
+            </label>
+
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={doorInward}
+                onChange={(e) => setDoorInward(e.target.checked)}
+              />
+              Inward Swing
+            </label>
+
+            <label className="text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={doorLabelInput}
+                onChange={(e) => setDoorLabelInput(e.target.value)}
+                placeholder="Exit A"
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-emerald-600 px-4 py-2 text-white"
+            onClick={addDoorOrOpening}
+            type="button"
+          >
+            Add Door / Opening
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {doors.map((item) => (
+              <div key={item.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {item.label || `${item.kind} ${item.id}`}
+                </div>
+                <div>Wall ID: {item.wallId}</div>
+                <div>Offset: {formatFeet(item.offset)}</div>
+                <div>Width: {formatFeet(item.width)}</div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteDoor(item.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">4) Windows</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="col-span-2 text-sm">
+              Wall
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={windowWallId}
+                onChange={(e) => setWindowWallId(Number(e.target.value))}
+              >
+                <option value={0}>Select a wall</option>
+                {walls.map((wall) => (
+                  <option key={wall.id} value={wall.id}>
+                    {wall.label || `Wall ${wall.id}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="text-sm">
+              Offset From Wall Start
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={windowOffsetInput}
+                onChange={(e) => setWindowOffsetInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={windowWidthInput}
+                onChange={(e) => setWindowWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={windowLabelInput}
+                onChange={(e) => setWindowLabelInput(e.target.value)}
+                placeholder="Window A"
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-sky-600 px-4 py-2 text-white"
+            onClick={addWindow}
+            type="button"
+          >
+            Add Window
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {windows.map((item) => (
+              <div key={item.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {item.label || `Window ${item.id}`}
+                </div>
+                <div>Wall ID: {item.wallId}</div>
+                <div>Offset: {formatFeet(item.offset)}</div>
+                <div>Width: {formatFeet(item.width)}</div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteWindow(item.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">5) Stairs</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairXInput}
+                onChange={(e) => setStairXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairYInput}
+                onChange={(e) => setStairYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairWidthInput}
+                onChange={(e) => setStairWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Height
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairHeightInput}
+                onChange={(e) => setStairHeightInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Steps
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairStepsInput}
+                onChange={(e) => setStairStepsInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Direction
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairDirection}
+                onChange={(e) =>
+                  setStairDirection(e.target.value as "up" | "down")
+                }
+              >
+                <option value="up">Up</option>
+                <option value="down">Down</option>
+              </select>
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={stairLabelInput}
+                onChange={(e) => setStairLabelInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-slate-700 px-4 py-2 text-white"
+            onClick={addStairs}
+            type="button"
+          >
+            Add Stairs
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {stairs.map((stair) => (
+              <div key={stair.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {stair.label || `Stair ${stair.id}`}
+                </div>
+                <div>
+                  Position: {formatFeet(stair.x)}, {formatFeet(stair.y)}
+                </div>
+                <div>
+                  Size: {formatFeet(stair.width)} ×{" "}
+                  {formatFeet(stair.height)}
+                </div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteStair(stair.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">6) Room Labels</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={roomLabelXInput}
+                onChange={(e) => setRoomLabelXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={roomLabelYInput}
+                onChange={(e) => setRoomLabelYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Label Text
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={roomLabelTextInput}
+                onChange={(e) => setRoomLabelTextInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-violet-600 px-4 py-2 text-white"
+            onClick={addRoomLabel}
+            type="button"
+          >
+            Add Room Label
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {roomLabels.map((label) => (
+              <div key={label.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">{label.text}</div>
+                <div>
+                  Position: {formatFeet(label.x)}, {formatFeet(label.y)}
+                </div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteRoomLabel(label.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">7) Manual Exit Paths</h3>
+
+          <div className="grid grid-cols-1 gap-3">
+            <label className="text-sm">
+              Path Points (x,y; x,y; x,y)
+              <textarea
+                className="mt-1 min-h-[100px] w-full rounded-lg border p-2"
+                value={exitPathPointsInput}
+                onChange={(e) => setExitPathPointsInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={exitPathLabelInput}
+                onChange={(e) => setExitPathLabelInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-green-700 px-4 py-2 text-white"
+            onClick={addExitPath}
+            type="button"
+          >
+            Add Manual Exit Path
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {exitPaths.map((path) => (
+              <div key={path.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {path.label || `Path ${path.id}`}
+                </div>
+                <div>Points: {path.points.length}</div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteExitPath(path.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">8) Fire Extinguishers</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={fireXInput}
+                onChange={(e) => setFireXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={fireYInput}
+                onChange={(e) => setFireYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Icon Size
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={fireSizeInput}
+                onChange={(e) => setFireSizeInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={fireLabelInput}
+                onChange={(e) => setFireLabelInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-red-700 px-4 py-2 text-white"
+            onClick={addFireExtinguisher}
+            type="button"
+          >
+            Add Fire Extinguisher
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {fireExtinguishers.map((item) => (
+              <div key={item.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {item.label || `FE ${item.id}`}
+                </div>
+                <div>
+                  Position: {formatFeet(item.x)}, {formatFeet(item.y)}
+                </div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteFireExtinguisher(item.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">9) Logo & Title Block</h3>
+
+          <label className="text-sm">
+            Upload Logo
+            <input
+              type="file"
+              accept="image/*"
+              className="mt-1 block w-full rounded-lg border p-2"
+              onChange={handleLogoUpload}
+            />
+          </label>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              Logo Placement
+              <select
+                className="mt-1 w-full rounded-lg border p-2"
+                value={logoPlacement}
+                onChange={(e) =>
+                  setLogoPlacement(e.target.value as LogoPlacement)
+                }
+              >
+                <option value="top-left">Top Left</option>
+                <option value="top-center">Top Center</option>
+                <option value="top-right">Top Right</option>
+                <option value="bottom-left">Bottom Left</option>
+                <option value="bottom-center">Bottom Center</option>
+                <option value="bottom-right">Bottom Right</option>
+              </select>
+            </label>
+
+            <label className="text-sm">
+              Logo Size
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={logoSizeInput}
+                onChange={(e) => setLogoSizeInput(e.target.value)}
+              />
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Logo Padding
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={logoPaddingInput}
+                onChange={(e) => setLogoPaddingInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3">
+            <label className="text-sm">
+              Project Title
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.projectTitle}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    projectTitle: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="text-sm">
+              Building Name
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.buildingName}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    buildingName: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="text-sm">
+              Floor Name
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.floorName}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    floorName: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="text-sm">
+              Drawn By
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.drawnBy}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    drawnBy: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="text-sm">
+              Date
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.date}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    date: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="text-sm">
+              Revision
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={titleBlock.revision}
+                onChange={(e) =>
+                  setTitleBlock((prev) => ({
+                    ...prev,
+                    revision: e.target.value,
+                  }))
+                }
+              />
+            </label>
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">10) Smart Evacuation Routing</h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              You Are Here X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={youAreHereXInput}
+                onChange={(e) => setYouAreHereXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              You Are Here Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={youAreHereYInput}
+                onChange={(e) => setYouAreHereYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Grid Resolution
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={gridResolutionInput}
+                onChange={(e) => setGridResolutionInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Max Travel Distance
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={maxTravelDistanceInput}
+                onChange={(e) => setMaxTravelDistanceInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              className="rounded-xl bg-amber-500 px-4 py-2 text-white"
+              onClick={autoPlaceYouAreHere}
+              type="button"
+            >
+              Auto-Place You Are Here
+            </button>
+
+            <button
+              className="rounded-xl bg-red-700 px-4 py-2 text-white"
+              onClick={generateSmartEvacuation}
+              type="button"
+            >
+              Generate Smart Routes
+            </button>
+          </div>
+
+          <div className="rounded-xl bg-gray-50 p-3 text-sm">
+            <div>
+              Detected exits: <strong>{detectedExitTargets.length}</strong>
+            </div>
+            <div className="mt-1 text-gray-600">
+              Tip: use labels like <strong>Exit</strong>,{" "}
+              <strong>Gate</strong>, or <strong>Beach Access Gate</strong> on
+              room labels or door labels.
+            </div>
+          </div>
+
+          {routeMessage && (
+            <div className="rounded-xl border border-gray-200 bg-white p-3 text-sm">
+              {routeMessage}
+            </div>
+          )}
+
+          <div className="max-h-48 space-y-2 overflow-auto">
+            {travelChecks.map((check, index) => (
+              <div
+                key={`${check.exitLabel}-${index}`}
+                className="rounded-xl border p-3 text-sm"
+              >
+                <div className="font-semibold">{check.exitLabel}</div>
+                <div>Distance: {formatFeet(check.distance)}</div>
+                <div
+                  className={
+                    check.compliant ? "text-green-700" : "text-red-700"
+                  }
+                >
+                  {check.compliant
+                    ? "Compliant"
+                    : "Exceeds travel distance"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">
+            11) Blocked Corridors / Hazard Zones
+          </h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={blockedZoneXInput}
+                onChange={(e) => setBlockedZoneXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={blockedZoneYInput}
+                onChange={(e) => setBlockedZoneYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={blockedZoneWidthInput}
+                onChange={(e) => setBlockedZoneWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Height
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={blockedZoneHeightInput}
+                onChange={(e) => setBlockedZoneHeightInput(e.target.value)}
+              />
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Label
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={blockedZoneLabelInput}
+                onChange={(e) => setBlockedZoneLabelInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <button
+            className="w-full rounded-xl bg-rose-600 px-4 py-2 text-white"
+            onClick={addBlockedZone}
+            type="button"
+          >
+            Add Blocked Zone
+          </button>
+
+          <div className="max-h-40 space-y-2 overflow-auto">
+            {blockedZones.map((zone) => (
+              <div key={zone.id} className="rounded-xl border p-3 text-sm">
+                <div className="font-semibold">
+                  {zone.label || `Blocked Zone ${zone.id}`}
+                </div>
+                <div>
+                  Position: {formatFeet(zone.x)}, {formatFeet(zone.y)}
+                </div>
+                <div>
+                  Size: {formatFeet(zone.width)} × {formatFeet(zone.height)}
+                </div>
+                <button
+                  className="mt-2 rounded-lg bg-red-600 px-3 py-1 text-white"
+                  onClick={() => deleteBlockedZone(zone.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">
+            12) Occupant Load & Basic Compliance
+          </h3>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              Occupiable Area
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={occupiableAreaInput}
+                onChange={(e) => setOccupiableAreaInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Load Factor
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={occupantLoadFactorInput}
+                onChange={(e) => setOccupantLoadFactorInput(e.target.value)}
+              />
+            </label>
+
+            <label className="col-span-2 text-sm">
+              Occupancy Classification
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={occupancyClassification}
+                onChange={(e) =>
+                  setOccupancyClassification(e.target.value)
+                }
+              />
+            </label>
+          </div>
+
+          <div className="rounded-xl bg-gray-50 p-3 text-sm space-y-1">
+            <div>
+              Occupancy Type: <strong>{occupancyClassification}</strong>
+            </div>
+            <div>
+              Calculated Occupant Load: <strong>{occupantLoad}</strong>
+            </div>
+            <div>
+              Minimum Exits Needed:{" "}
+              <strong>{exitCountCheck.minimumExits}</strong>
+            </div>
+            <div
+              className={
+                exitCountCheck.compliant
+                  ? "text-green-700"
+                  : "text-red-700"
+              }
+            >
+              Exits Provided: <strong>{exitCountCheck.provided}</strong> —{" "}
+              {exitCountCheck.compliant
+                ? "Compliant"
+                : "Insufficient exits"}
+            </div>
+          </div>
+        </section>
+
+        <section className="space-y-3 border-t pt-4">
+          <h3 className="text-lg font-semibold">
+            13) Uploaded Floor Plan & Zoom
+          </h3>
+
+          <label className="text-sm">
+            Upload Existing Floor Plan
+            <input
+              type="file"
+              accept="image/*"
+              className="mt-1 block w-full rounded-lg border p-2"
+              onChange={handleUploadedPlanFile}
+            />
+          </label>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              Image X
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={uploadedPlanXInput}
+                onChange={(e) => setUploadedPlanXInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Image Y
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={uploadedPlanYInput}
+                onChange={(e) => setUploadedPlanYInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Image Width
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={uploadedPlanWidthInput}
+                onChange={(e) => setUploadedPlanWidthInput(e.target.value)}
+              />
+            </label>
+
+            <label className="text-sm">
+              Image Height
+              <input
+                className="mt-1 w-full rounded-lg border p-2"
+                value={uploadedPlanHeightInput}
+                onChange={(e) => setUploadedPlanHeightInput(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <label className="text-sm block">
+            Image Opacity: {uploadedPlanOpacity.toFixed(2)}
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={uploadedPlanOpacity}
+              onChange={(e) => setUploadedPlanOpacity(Number(e.target.value))}
+              className="mt-2 w-full"
+            />
+          </label>
+
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={showUploadedPlan}
+              onChange={(e) => setShowUploadedPlan(e.target.checked)}
+            />
+            Show Uploaded Floor Plan
+          </label>
+
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              className="rounded-xl bg-slate-700 px-4 py-2 text-white"
+              onClick={fitUploadedPlanToCanvas}
+              type="button"
+            >
+              Fit Image To Canvas
+            </button>
+
+            <button
+              className="rounded-xl bg-gray-300 px-4 py-2 text-gray-900"
+              onClick={clearUploadedPlan}
+              type="button"
+            >
+              Clear Image
+            </button>
+          </div>
+
+          <div className="rounded-xl bg-gray-50 p-3 text-sm">
+            <div>
+              Zoom: <strong>{safeZoom.toFixed(2)}x</strong>
+            </div>
+            <div className="mt-1 text-gray-600">
+              Use the zoom buttons, pan buttons, or mouse wheel over the
+              preview.
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <button
+              className="rounded-xl bg-blue-600 px-4 py-2 text-white"
+              onClick={zoomInPreview}
+              type="button"
+            >
+              🔍+
+            </button>
+
+            <button
+              className="rounded-xl bg-blue-600 px-4 py-2 text-white"
+              onClick={zoomOutPreview}
+              type="button"
+            >
+              🔍-
+            </button>
+
+            <button
+              className="rounded-xl bg-gray-300 px-4 py-2 text-gray-900"
+              onClick={resetPreviewZoom}
+              type="button"
+            >
+              Reset
+            </button>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div />
+            <button
+              className="rounded-xl bg-gray-800 px-4 py-2 text-white"
+              onClick={() => panPreview(0, -10 / safeZoom)}
+              type="button"
+            >
+              ↑
+            </button>
+            <div />
+            <button
+              className="rounded-xl bg-gray-800 px-4 py-2 text-white"
+              onClick={() => panPreview(-10 / safeZoom, 0)}
+              type="button"
+            >
+              ←
+            </button>
+            <button
+              className="rounded-xl bg-gray-800 px-4 py-2 text-white"
+              onClick={() => panPreview(0, 10 / safeZoom)}
+              type="button"
+            >
+              ↓
+            </button>
+            <button
+              className="rounded-xl bg-gray-800 px-4 py-2 text-white"
+              onClick={() => panPreview(10 / safeZoom, 0)}
+              type="button"
+            >
+              →
+            </button>
+          </div>
+        </section>
+
+        <div className="border-t pt-4">
+          <button
+            className="w-full rounded-xl bg-black px-4 py-3 text-white"
+            onClick={downloadSvg}
+            type="button"
+          >
+            Download SVG
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+        <h2 className="mb-4 text-xl font-bold">Live Preview</h2>
+
+        <div
+          className="overflow-auto rounded-xl border bg-gray-50 p-3"
+          onWheel={handlePreviewWheel}
+        >
+          <svg
+            ref={svgRef}
+            viewBox={previewViewBox}
+            className="min-h-[820px] w-full h-auto"
+            preserveAspectRatio="xMidYMid meet"
+          >
+            <defs>
+              <marker
+                id="exit-arrow"
+                markerWidth="6"
+                markerHeight="6"
+                refX="5"
+                refY="3"
+                orient="auto"
+                markerUnits="strokeWidth"
+                viewBox="0 0 6 6"
+              >
+                <path d="M 0 0 L 6 3 L 0 6 z" fill="#16a34a" />
+              </marker>
+            </defs>
+
+            <rect
+              x={0}
+              y={0}
+              width={planWidth}
+              height={planHeight}
+              fill="#f8fafc"
+            />
+
+            {gridLines}
+
+            <rect
+              x={0}
+              y={0}
+              width={planWidth}
+              height={planHeight}
+              fill="none"
+              stroke="#94a3b8"
+              strokeWidth={0.08}
+            />
+
+            {showUploadedPlan && uploadedPlanDataUrl && (
+              <image
+                href={uploadedPlanDataUrl}
+                x={uploadedPlanX}
+                y={uploadedPlanY}
+                width={uploadedPlanWidth}
+                height={uploadedPlanHeight}
+                opacity={uploadedPlanOpacity}
+                preserveAspectRatio="none"
+                pointerEvents="none"
+              />
+            )}
+
+            {renderBlockedZones()}
+
+            {walls.map((wall) => (
+              <g key={`wall-${wall.id}`}>
+                <polygon
+                  points={pointsToSvgString(wallPolygonPoints(wall))}
+                  fill="#1f2937"
+                />
+                {renderWallLabel(wall)}
+              </g>
+            ))}
+
+            {windows.map((item) => renderWindow(item))}
+            {doors.map((item) => renderDoorOrOpening(item))}
+            {stairs.map((stair) => renderStair(stair))}
+            {roomLabels.map((label) => renderRoomLabel(label))}
+            {exitPaths.map((path) => renderExitPath(path))}
+            {fireExtinguishers.map((item) => renderFireExtinguisher(item))}
+
+            {renderAutoRoutes()}
+            {renderDetectedExits()}
+            {renderAutoSafetySymbols()}
+            {renderYouAreHere()}
+            {renderLegend()}
+
+            {renderLogo()}
+            {renderTitleBlock()}
+          </svg>
+        </div>
+      </div>
+    </div>
+  );
+}
